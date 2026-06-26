@@ -5,11 +5,15 @@ import secrets
 from contextlib import asynccontextmanager
 from urllib.parse import urlencode
 from dotenv import load_dotenv
-from mcp.server.fastmcp import FastMCP
+from mcp.server.lowlevel import Server
+from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+from mcp.server.sse import SseServerTransport
+from mcp.types import Tool, TextContent
 from starlette.applications import Starlette
 from starlette.routing import Route, Mount
 from starlette.requests import Request
 from starlette.responses import JSONResponse, RedirectResponse, HTMLResponse
+from starlette.types import Receive, Scope, Send
 import uvicorn
 
 load_dotenv()
@@ -26,7 +30,12 @@ token_store = {}
 pending_auth = {}
 code_store = {}
 
-mcp = FastMCP('whoop-mce', stateless_http=True)
+app_server = Server('whoop-mce')
+session_manager = StreamableHTTPSessionManager(
+    app=app_server,
+    stateless=True,
+)
+sse = SseServerTransport('/messages/')
 
 def get_headers():
     token = token_store.get('access_token')
@@ -34,47 +43,43 @@ def get_headers():
         raise ValueError('Not authenticated.')
     return {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
 
-@mcp.tool()
-def get_auth_status() -> str:
-    """Check WHOOP authentication status"""
-    return f'Authenticated: {bool(token_store.get("access_token"))}'
+@app_server.list_tools()
+async def list_tools():
+    return [
+        Tool(name='get_today_recovery', description='Get recovery score, HRV, and RHR for today', inputSchema={'type': 'object', 'properties': {}}),
+        Tool(name='get_latest_cycle', description='Get the latest WHOOP cycle data', inputSchema={'type': 'object', 'properties': {}}),
+        Tool(name='get_recovery_range', description='Get recovery data for a date range', inputSchema={'type': 'object', 'properties': {'start_date': {'type': 'string'}, 'end_date': {'type': 'string'}}, 'required': ['start_date', 'end_date']}),
+        Tool(name='get_sleep_range', description='Get sleep data for a date range', inputSchema={'type': 'object', 'properties': {'start_date': {'type': 'string'}, 'end_date': {'type': 'string'}}, 'required': ['start_date', 'end_date']}),
+        Tool(name='get_profile', description='Get WHOOP user profile', inputSchema={'type': 'object', 'properties': {}}),
+        Tool(name='get_auth_status', description='Check WHOOP authentication status', inputSchema={'type': 'object', 'properties': {}}),
+    ]
 
-@mcp.tool()
-def get_today_recovery() -> str:
-    """Get recovery score, HRV, and RHR for today"""
-    headers = get_headers()
-    resp = httpx.get(f'{WHOOP_API_BASE}/recovery', headers=headers)
-    return json.dumps(resp.json(), indent=2)
-
-@mcp.tool()
-def get_latest_cycle() -> str:
-    """Get the latest WHOOP cycle data"""
-    headers = get_headers()
-    resp = httpx.get(f'{WHOOP_API_BASE}/cycle', headers=headers, params={'limit': 1})
-    return json.dumps(resp.json(), indent=2)
-
-@mcp.tool()
-def get_recovery_range(start_date: str, end_date: str) -> str:
-    """Get recovery data for a date range (YYYY-MM-DD format)"""
-    headers = get_headers()
-    params = {'start': start_date + 'T00:00:00.000Z', 'end': end_date + 'T23:59:59.999Z'}
-    resp = httpx.get(f'{WHOOP_API_BASE}/recovery', headers=headers, params=params)
-    return json.dumps(resp.json(), indent=2)
-
-@mcp.tool()
-def get_sleep_range(start_date: str, end_date: str) -> str:
-    """Get sleep data for a date range (YYYY-MM-DD format)"""
-    headers = get_headers()
-    params = {'start': start_date + 'T00:00:00.000Z', 'end': end_date + 'T23:59:59.999Z'}
-    resp = httpx.get(f'{WHOOP_API_BASE}/activity/sleep', headers=headers, params=params)
-    return json.dumps(resp.json(), indent=2)
-
-@mcp.tool()
-def get_profile() -> str:
-    """Get WHOOP user profile"""
-    headers = get_headers()
-    resp = httpx.get(f'{WHOOP_API_BASE}/user/profile/basic', headers=headers)
-    return json.dumps(resp.json(), indent=2)
+@app_server.call_tool()
+async def call_tool(name: str, arguments: dict):
+    if name == 'get_auth_status':
+        return [TextContent(type='text', text=f'Authenticated: {bool(token_store.get("access_token"))}')]
+    try:
+        headers = get_headers()
+    except ValueError as e:
+        return [TextContent(type='text', text=str(e))]
+    if name == 'get_today_recovery':
+        resp = httpx.get(f'{WHOOP_API_BASE}/recovery', headers=headers)
+        return [TextContent(type='text', text=json.dumps(resp.json(), indent=2))]
+    elif name == 'get_latest_cycle':
+        resp = httpx.get(f'{WHOOP_API_BASE}/cycle', headers=headers, params={'limit': 1})
+        return [TextContent(type='text', text=json.dumps(resp.json(), indent=2))]
+    elif name == 'get_recovery_range':
+        params = {'start': arguments['start_date'] + 'T00:00:00.000Z', 'end': arguments['end_date'] + 'T23:59:59.999Z'}
+        resp = httpx.get(f'{WHOOP_API_BASE}/recovery', headers=headers, params=params)
+        return [TextContent(type='text', text=json.dumps(resp.json(), indent=2))]
+    elif name == 'get_sleep_range':
+        params = {'start': arguments['start_date'] + 'T00:00:00.000Z', 'end': arguments['end_date'] + 'T23:59:59.999Z'}
+        resp = httpx.get(f'{WHOOP_API_BASE}/activity/sleep', headers=headers, params=params)
+        return [TextContent(type='text', text=json.dumps(resp.json(), indent=2))]
+    elif name == 'get_profile':
+        resp = httpx.get(f'{WHOOP_API_BASE}/user/profile/basic', headers=headers)
+        return [TextContent(type='text', text=json.dumps(resp.json(), indent=2))]
+    return [TextContent(type='text', text=f'Unknown tool: {name}')]
 
 async def health(request: Request):
     return JSONResponse({'status': 'ok', 'service': 'whoop-mce'})
@@ -172,12 +177,17 @@ async def token_endpoint(request: Request):
         })
     return JSONResponse({'error': 'unsupported_grant_type'}, status_code=400)
 
+async def handle_streamable_http(scope: Scope, receive: Receive, send: Send):
+    await session_manager.handle_request(scope, receive, send)
+
+async def handle_sse(request: Request):
+    async with sse.connect_sse(request.scope, request.receive, request._send) as streams:
+        await app_server.run(streams[0], streams[1], app_server.create_initialization_options())
+
 @asynccontextmanager
 async def lifespan(app):
-    async with mcp.session_manager.run():
+    async with session_manager.run():
         yield
-
-mcp_app = mcp.streamable_http_app()
 
 app = Starlette(
     lifespan=lifespan,
@@ -189,7 +199,9 @@ app = Starlette(
         Route('/token', token_endpoint, methods=['POST']),
         Route('/callback', whoop_callback),
         Route('/auth', authorize),
-        Mount('/', app=mcp_app),
+        Route('/sse', handle_sse),
+        Mount('/messages', app=sse.handle_post_message),
+        Mount('/', app=handle_streamable_http),
     ]
 )
 
