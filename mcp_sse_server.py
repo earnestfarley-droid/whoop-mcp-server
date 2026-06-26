@@ -24,7 +24,10 @@ REDIRECT_URI = os.environ.get('WHOOP_REDIRECT_URI', '')
 AUTH_URL = os.environ.get('WHOOP_AUTH_URL', 'https://api.prod.whoop.com/oauth/oauth2/auth')
 TOKEN_URL = os.environ.get('WHOOP_TOKEN_URL', 'https://api.prod.whoop.com/oauth/oauth2/token')
 SCOPES = os.environ.get('WHOOP_SCOPES', 'offline read:recovery read:sleep read:cycles read:workout read:profile read:body_measurement')
-WHOOP_API_BASE = 'https://api.prod.whoop.com/developer/v1'
+
+# v1 base for cycle/profile endpoints, v2 base for recovery and sleep
+WHOOP_API_V1 = 'https://api.prod.whoop.com/developer/v1'
+WHOOP_API_V2 = 'https://api.prod.whoop.com/developer/v2'
 
 token_store = {}
 pending_auth = {}
@@ -46,10 +49,10 @@ def get_headers():
 @app_server.list_tools()
 async def list_tools():
     return [
-        Tool(name='get_today_recovery', description='Get recovery score, HRV, and RHR for today', inputSchema={'type': 'object', 'properties': {}}),
-        Tool(name='get_latest_cycle', description='Get the latest WHOOP cycle data', inputSchema={'type': 'object', 'properties': {}}),
-        Tool(name='get_recovery_range', description='Get recovery data for a date range', inputSchema={'type': 'object', 'properties': {'start_date': {'type': 'string'}, 'end_date': {'type': 'string'}}, 'required': ['start_date', 'end_date']}),
-        Tool(name='get_sleep_range', description='Get sleep data for a date range', inputSchema={'type': 'object', 'properties': {'start_date': {'type': 'string'}, 'end_date': {'type': 'string'}}, 'required': ['start_date', 'end_date']}),
+        Tool(name='get_today_recovery', description='Get recovery score, HRV, and RHR for today (most recent recovery)', inputSchema={'type': 'object', 'properties': {}}),
+        Tool(name='get_latest_cycle', description='Get the latest WHOOP physiological cycle', inputSchema={'type': 'object', 'properties': {}}),
+        Tool(name='get_recovery_range', description='Get recovery data for a date range (YYYY-MM-DD)', inputSchema={'type': 'object', 'properties': {'start_date': {'type': 'string', 'description': 'Start date YYYY-MM-DD'}, 'end_date': {'type': 'string', 'description': 'End date YYYY-MM-DD'}}, 'required': ['start_date', 'end_date']}),
+        Tool(name='get_sleep_range', description='Get sleep data for a date range (YYYY-MM-DD)', inputSchema={'type': 'object', 'properties': {'start_date': {'type': 'string', 'description': 'Start date YYYY-MM-DD'}, 'end_date': {'type': 'string', 'description': 'End date YYYY-MM-DD'}}, 'required': ['start_date', 'end_date']}),
         Tool(name='get_profile', description='Get WHOOP user profile', inputSchema={'type': 'object', 'properties': {}}),
         Tool(name='get_auth_status', description='Check WHOOP authentication status', inputSchema={'type': 'object', 'properties': {}}),
     ]
@@ -62,23 +65,41 @@ async def call_tool(name: str, arguments: dict):
         headers = get_headers()
     except ValueError as e:
         return [TextContent(type='text', text=str(e))]
+
     if name == 'get_today_recovery':
-        resp = httpx.get(f'{WHOOP_API_BASE}/recovery', headers=headers)
+        # v2 recovery endpoint - limit 1 returns most recent
+        resp = httpx.get(f'{WHOOP_API_V2}/recovery', headers=headers, params={'limit': 1})
         return [TextContent(type='text', text=json.dumps(resp.json(), indent=2))]
+
     elif name == 'get_latest_cycle':
-        resp = httpx.get(f'{WHOOP_API_BASE}/cycle', headers=headers, params={'limit': 1})
+        # v2 cycle endpoint
+        resp = httpx.get(f'{WHOOP_API_V2}/cycle', headers=headers, params={'limit': 1})
         return [TextContent(type='text', text=json.dumps(resp.json(), indent=2))]
+
     elif name == 'get_recovery_range':
-        params = {'start': arguments['start_date'] + 'T00:00:00.000Z', 'end': arguments['end_date'] + 'T23:59:59.999Z'}
-        resp = httpx.get(f'{WHOOP_API_BASE}/recovery', headers=headers, params=params)
+        # v2 recovery endpoint with date range
+        params = {
+            'start': arguments['start_date'] + 'T00:00:00.000Z',
+            'end': arguments['end_date'] + 'T23:59:59.999Z',
+            'limit': 25,
+        }
+        resp = httpx.get(f'{WHOOP_API_V2}/recovery', headers=headers, params=params)
         return [TextContent(type='text', text=json.dumps(resp.json(), indent=2))]
+
     elif name == 'get_sleep_range':
-        params = {'start': arguments['start_date'] + 'T00:00:00.000Z', 'end': arguments['end_date'] + 'T23:59:59.999Z'}
-        resp = httpx.get(f'{WHOOP_API_BASE}/activity/sleep', headers=headers, params=params)
+        # v2 sleep endpoint - correct path is /v2/activity/sleep
+        params = {
+            'start': arguments['start_date'] + 'T00:00:00.000Z',
+            'end': arguments['end_date'] + 'T23:59:59.999Z',
+            'limit': 25,
+        }
+        resp = httpx.get(f'{WHOOP_API_V2}/activity/sleep', headers=headers, params=params)
         return [TextContent(type='text', text=json.dumps(resp.json(), indent=2))]
+
     elif name == 'get_profile':
-        resp = httpx.get(f'{WHOOP_API_BASE}/user/profile/basic', headers=headers)
+        resp = httpx.get(f'{WHOOP_API_V1}/user/profile/basic', headers=headers)
         return [TextContent(type='text', text=json.dumps(resp.json(), indent=2))]
+
     return [TextContent(type='text', text=f'Unknown tool: {name}')]
 
 async def health(request: Request):
