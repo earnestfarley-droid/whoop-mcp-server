@@ -22,6 +22,7 @@ AUTH_URL = os.environ.get('WHOOP_AUTH_URL', 'https://api.prod.whoop.com/oauth/oa
 TOKEN_URL = os.environ.get('WHOOP_TOKEN_URL', 'https://api.prod.whoop.com/oauth/oauth2/token')
 SCOPES = os.environ.get('WHOOP_SCOPES', 'offline read:recovery read:sleep read:cycles read:workout read:profile read:body_measurement')
 WHOOP_API_BASE = 'https://api.prod.whoop.com/developer/v1'
+BASE_URL = os.environ.get('BASE_URL', '')
 
 token_store = {}
 pending_auth = {}
@@ -80,7 +81,7 @@ async def health(request: Request):
     return JSONResponse({'status': 'ok', 'service': 'whoop-mcp'})
 
 async def oauth_metadata(request: Request):
-    base = str(request.base_url).rstrip('/')
+        base = BASE_URL or str(request.base_url).rstrip('/').replace('http://', 'https://')
     return JSONResponse({
         'issuer': base,
         'authorization_endpoint': f'{base}/authorize',
