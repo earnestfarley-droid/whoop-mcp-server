@@ -81,7 +81,7 @@ async def health(request: Request):
     return JSONResponse({'status': 'ok', 'service': 'whoop-mcp'})
 
 async def oauth_metadata(request: Request):
-        base = BASE_URL or str(request.base_url).rstrip('/').replace('http://', 'https://')
+    base = BASE_URL or str(request.base_url).rstrip('/').replace('http://', 'https://')
     return JSONResponse({
         'issuer': base,
         'authorization_endpoint': f'{base}/authorize',
