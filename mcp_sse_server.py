@@ -24,14 +24,32 @@ REDIRECT_URI = os.environ.get('WHOOP_REDIRECT_URI', '')
 AUTH_URL = os.environ.get('WHOOP_AUTH_URL', 'https://api.prod.whoop.com/oauth/oauth2/auth')
 TOKEN_URL = os.environ.get('WHOOP_TOKEN_URL', 'https://api.prod.whoop.com/oauth/oauth2/token')
 SCOPES = os.environ.get('WHOOP_SCOPES', 'offline read:recovery read:sleep read:cycles read:workout read:profile read:body_measurement')
-
-# v1 base for cycle/profile endpoints, v2 base for recovery and sleep
 WHOOP_API_V1 = 'https://api.prod.whoop.com/developer/v1'
 WHOOP_API_V2 = 'https://api.prod.whoop.com/developer/v2'
 
-token_store = {}
+TOKEN_FILE = '/tmp/whoop_tokens.json'
+
 pending_auth = {}
 code_store = {}
+
+
+def load_tokens():
+    try:
+        with open(TOKEN_FILE, 'r') as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_tokens(data):
+    try:
+        with open(TOKEN_FILE, 'w') as f:
+            json.dump(data, f)
+    except Exception:
+        pass
+
+
+token_store = load_tokens()
 
 app_server = Server('whoop-mce')
 session_manager = StreamableHTTPSessionManager(
@@ -40,70 +58,97 @@ session_manager = StreamableHTTPSessionManager(
 )
 sse = SseServerTransport('/messages/')
 
+
 def get_headers():
     token = token_store.get('access_token')
     if not token:
-        raise ValueError('Not authenticated.')
+        raise ValueError('Not authenticated. Please reconnect the WHOOP MCE connector.')
     return {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
+
+
+def maybe_refresh():
+    rt = token_store.get('refresh_token')
+    if not rt:
+        return False
+    try:
+        resp = httpx.post(TOKEN_URL, data={
+            'grant_type': 'refresh_token',
+            'refresh_token': rt,
+            'client_id': CLIENT_ID,
+            'client_secret': CLIENT_SECRET,
+        })
+        if resp.status_code == 200:
+            data = resp.json()
+            token_store['access_token'] = data.get('access_token', '')
+            token_store['refresh_token'] = data.get('refresh_token', rt)
+            save_tokens(token_store)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def call_whoop(method, url, **kwargs):
+    headers = get_headers()
+    resp = httpx.request(method, url, headers=headers, **kwargs)
+    if resp.status_code == 401:
+        if maybe_refresh():
+            headers = get_headers()
+            resp = httpx.request(method, url, headers=headers, **kwargs)
+    return resp
+
 
 @app_server.list_tools()
 async def list_tools():
     return [
         Tool(name='get_today_recovery', description='Get recovery score, HRV, and RHR for today (most recent recovery)', inputSchema={'type': 'object', 'properties': {}}),
         Tool(name='get_latest_cycle', description='Get the latest WHOOP physiological cycle', inputSchema={'type': 'object', 'properties': {}}),
-        Tool(name='get_recovery_range', description='Get recovery data for a date range (YYYY-MM-DD)', inputSchema={'type': 'object', 'properties': {'start_date': {'type': 'string', 'description': 'Start date YYYY-MM-DD'}, 'end_date': {'type': 'string', 'description': 'End date YYYY-MM-DD'}}, 'required': ['start_date', 'end_date']}),
-        Tool(name='get_sleep_range', description='Get sleep data for a date range (YYYY-MM-DD)', inputSchema={'type': 'object', 'properties': {'start_date': {'type': 'string', 'description': 'Start date YYYY-MM-DD'}, 'end_date': {'type': 'string', 'description': 'End date YYYY-MM-DD'}}, 'required': ['start_date', 'end_date']}),
+        Tool(name='get_recovery_range', description='Get recovery data for a date range (YYYY-MM-DD)', inputSchema={'type': 'object', 'properties': {'start_date': {'type': 'string'}, 'end_date': {'type': 'string'}}, 'required': ['start_date', 'end_date']}),
+        Tool(name='get_sleep_range', description='Get sleep data for a date range (YYYY-MM-DD)', inputSchema={'type': 'object', 'properties': {'start_date': {'type': 'string'}, 'end_date': {'type': 'string'}}, 'required': ['start_date', 'end_date']}),
         Tool(name='get_profile', description='Get WHOOP user profile', inputSchema={'type': 'object', 'properties': {}}),
         Tool(name='get_auth_status', description='Check WHOOP authentication status', inputSchema={'type': 'object', 'properties': {}}),
     ]
 
+
 @app_server.call_tool()
 async def call_tool(name: str, arguments: dict):
     if name == 'get_auth_status':
-        return [TextContent(type='text', text=f'Authenticated: {bool(token_store.get("access_token"))}')]
+        has_token = bool(token_store.get('access_token'))
+        has_refresh = bool(token_store.get('refresh_token'))
+        return [TextContent(type='text', text=f'Authenticated: {has_token}, Refresh token present: {has_refresh}')]
     try:
-        headers = get_headers()
+        get_headers()
     except ValueError as e:
         return [TextContent(type='text', text=str(e))]
 
     if name == 'get_today_recovery':
-        # v2 recovery endpoint - limit 1 returns most recent
-        resp = httpx.get(f'{WHOOP_API_V2}/recovery', headers=headers, params={'limit': 1})
+        resp = call_whoop('GET', f'{WHOOP_API_V2}/recovery', params={'limit': 1})
         return [TextContent(type='text', text=json.dumps(resp.json(), indent=2))]
 
     elif name == 'get_latest_cycle':
-        # v2 cycle endpoint
-        resp = httpx.get(f'{WHOOP_API_V2}/cycle', headers=headers, params={'limit': 1})
+        resp = call_whoop('GET', f'{WHOOP_API_V2}/cycle', params={'limit': 1})
         return [TextContent(type='text', text=json.dumps(resp.json(), indent=2))]
 
     elif name == 'get_recovery_range':
-        # v2 recovery endpoint with date range
-        params = {
-            'start': arguments['start_date'] + 'T00:00:00.000Z',
-            'end': arguments['end_date'] + 'T23:59:59.999Z',
-            'limit': 25,
-        }
-        resp = httpx.get(f'{WHOOP_API_V2}/recovery', headers=headers, params=params)
+        params = {'start': arguments['start_date'] + 'T00:00:00.000Z', 'end': arguments['end_date'] + 'T23:59:59.999Z', 'limit': 25}
+        resp = call_whoop('GET', f'{WHOOP_API_V2}/recovery', params=params)
         return [TextContent(type='text', text=json.dumps(resp.json(), indent=2))]
 
     elif name == 'get_sleep_range':
-        # v2 sleep endpoint - correct path is /v2/activity/sleep
-        params = {
-            'start': arguments['start_date'] + 'T00:00:00.000Z',
-            'end': arguments['end_date'] + 'T23:59:59.999Z',
-            'limit': 25,
-        }
-        resp = httpx.get(f'{WHOOP_API_V2}/activity/sleep', headers=headers, params=params)
+        params = {'start': arguments['start_date'] + 'T00:00:00.000Z', 'end': arguments['end_date'] + 'T23:59:59.999Z', 'limit': 25}
+        resp = call_whoop('GET', f'{WHOOP_API_V2}/activity/sleep', params=params)
         return [TextContent(type='text', text=json.dumps(resp.json(), indent=2))]
 
     elif name == 'get_profile':
-        resp = httpx.get(f'{WHOOP_API_V1}/user/profile/basic', headers=headers)
+        resp = call_whoop('GET', f'{WHOOP_API_V1}/user/profile/basic')
         return [TextContent(type='text', text=json.dumps(resp.json(), indent=2))]
 
     return [TextContent(type='text', text=f'Unknown tool: {name}')]
 
+
 async def health(request: Request):
-    return JSONResponse({'status': 'ok', 'service': 'whoop-mce'})
+    return JSONResponse({'status': 'ok', 'service': 'whoop-mce', 'authenticated': bool(token_store.get('access_token'))})
+
 
 async def oauth_metadata(request: Request):
     base = str(request.base_url).rstrip('/')
@@ -115,6 +160,7 @@ async def oauth_metadata(request: Request):
         'grant_types_supported': ['authorization_code', 'refresh_token'],
         'code_challenge_methods_supported': ['S256'],
     })
+
 
 async def authorize(request: Request):
     claude_redirect_uri = request.query_params.get('redirect_uri', '')
@@ -137,6 +183,7 @@ async def authorize(request: Request):
     }
     return RedirectResponse(url=AUTH_URL + '?' + urlencode(params))
 
+
 async def whoop_callback(request: Request):
     code = request.query_params.get('code', '')
     server_state = request.query_params.get('state', '')
@@ -158,10 +205,12 @@ async def whoop_callback(request: Request):
     tokens = resp.json()
     token_store['access_token'] = tokens.get('access_token', '')
     token_store['refresh_token'] = tokens.get('refresh_token', '')
+    save_tokens(token_store)
     internal_code = secrets.token_urlsafe(32)
     code_store[internal_code] = tokens
     redirect_params = urlencode({'code': internal_code, 'state': pending['claude_state']})
     return RedirectResponse(url=f"{pending['claude_redirect_uri']}?{redirect_params}")
+
 
 async def token_endpoint(request: Request):
     form = await request.form()
@@ -190,6 +239,7 @@ async def token_endpoint(request: Request):
         data = resp.json()
         token_store['access_token'] = data.get('access_token', '')
         token_store['refresh_token'] = data.get('refresh_token', rt)
+        save_tokens(token_store)
         return JSONResponse({
             'access_token': data.get('access_token', ''),
             'token_type': 'bearer',
@@ -198,17 +248,21 @@ async def token_endpoint(request: Request):
         })
     return JSONResponse({'error': 'unsupported_grant_type'}, status_code=400)
 
+
 async def handle_streamable_http(scope: Scope, receive: Receive, send: Send):
     await session_manager.handle_request(scope, receive, send)
+
 
 async def handle_sse(request: Request):
     async with sse.connect_sse(request.scope, request.receive, request._send) as streams:
         await app_server.run(streams[0], streams[1], app_server.create_initialization_options())
 
+
 @asynccontextmanager
 async def lifespan(app):
     async with session_manager.run():
         yield
+
 
 app = Starlette(
     lifespan=lifespan,
