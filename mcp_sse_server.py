@@ -50,7 +50,7 @@ async def list_tools():
 @app_server.call_tool()
 async def call_tool(name: str, arguments: dict):
     if name == 'get_auth_status':
-        return [TextContent(type='text', text=f'Authenticated: {bool(token_store.get("access_token"))}')]
+        return [TextContent(type='text', text=f'Authenticated: {bool(token_store.get("access_token"))}}')]
     try:
         headers = get_headers()
     except ValueError as e:
@@ -59,15 +59,17 @@ async def call_tool(name: str, arguments: dict):
         resp = httpx.get(f'{WHOOP_API_BASE}/recovery', headers=headers)
         return [TextContent(type='text', text=json.dumps(resp.json(), indent=2))]
     elif name == 'get_latest_cycle':
-        resp = httpx.get(f'{WHOOP_API_BASE}/cycle', headers=headers, params={'limit': 1})
+        resp = httpx.get(f'{WHOOP_API_BASE}/cycle', headers=headers)
         return [TextContent(type='text', text=json.dumps(resp.json(), indent=2))]
     elif name == 'get_recovery_range':
-        params = {'start': arguments['start_date'] + 'T00:00:00.000Z', 'end': arguments['end_date'] + 'T23:59:59.999Z'}
-        resp = httpx.get(f'{WHOOP_API_BASE}/recovery', headers=headers, params=params)
+        start = arguments.get('start_date', '')
+        end = arguments.get('end_date', '')
+        resp = httpx.get(f'{WHOOP_API_BASE}/recovery', params={'start': start, 'end': end}, headers=headers)
         return [TextContent(type='text', text=json.dumps(resp.json(), indent=2))]
     elif name == 'get_sleep_range':
-        params = {'start': arguments['start_date'] + 'T00:00:00.000Z', 'end': arguments['end_date'] + 'T23:59:59.999Z'}
-        resp = httpx.get(f'{WHOOP_API_BASE}/activity/sleep', headers=headers, params=params)
+        start = arguments.get('start_date', '')
+        end = arguments.get('end_date', '')
+        resp = httpx.get(f'{WHOOP_API_BASE}/sleep', params={'start': start, 'end': end}, headers=headers)
         return [TextContent(type='text', text=json.dumps(resp.json(), indent=2))]
     elif name == 'get_profile':
         resp = httpx.get(f'{WHOOP_API_BASE}/user/profile/basic', headers=headers)
@@ -75,7 +77,7 @@ async def call_tool(name: str, arguments: dict):
     return [TextContent(type='text', text=f'Unknown tool: {name}')]
 
 async def health(request: Request):
-    return JSONResponse({'status': 'ok', 'service': 'whoop-mce'})
+    return JSONResponse({'status': 'ok', 'service': 'whoop-mcp'})
 
 async def oauth_metadata(request: Request):
     base = str(request.base_url).rstrip('/')
@@ -84,49 +86,43 @@ async def oauth_metadata(request: Request):
         'authorization_endpoint': f'{base}/authorize',
         'token_endpoint': f'{base}/token',
         'response_types_supported': ['code'],
-        'code_challenge_methods_supported': ['S256'],
         'grant_types_supported': ['authorization_code', 'refresh_token'],
+        'code_challenge_methods_supported': ['S256'],
     })
 
 async def authorize(request: Request):
-    claude_redirect_uri = request.query_params.get('redirect_uri', '')
-    code_challenge = request.query_params.get('code_challenge', '')
-    code_challenge_method = request.query_params.get('code_challenge_method', 'S256')
-    claude_state = request.query_params.get('state', '')
-    server_state = secrets.token_urlsafe(32)
-    pending_auth[server_state] = {
-        'claude_redirect_uri': claude_redirect_uri,
-        'claude_state': claude_state,
-        'code_challenge': code_challenge,
-        'code_challenge_method': code_challenge_method,
+    state = request.query_params.get('state', '')
+    redirect_uri = request.query_params.get('redirect_uri', '')
+    claude_state = secrets.token_urlsafe(16)
+    pending_auth[claude_state] = {
+        'claude_state': state,
+        'claude_redirect_uri': redirect_uri,
     }
-    params = {
+    params = urlencode({
         'client_id': CLIENT_ID,
         'redirect_uri': REDIRECT_URI,
         'response_type': 'code',
         'scope': SCOPES,
-        'state': server_state,
-    }
-    return RedirectResponse(url=AUTH_URL + '?' + urlencode(params))
+        'state': claude_state,
+    })
+    return RedirectResponse(url=f'{AUTH_URL}?{params}')
 
 async def whoop_callback(request: Request):
     code = request.query_params.get('code', '')
-    server_state = request.query_params.get('state', '')
-    error = request.query_params.get('error', '')
-    if error:
-        return HTMLResponse(f'<h1>Auth Error: {error}</h1>', status_code=400)
-    pending = pending_auth.pop(server_state, None)
+    state = request.query_params.get('state', '')
+    pending = pending_auth.pop(state, None)
     if not pending:
-        return HTMLResponse('<h1>Invalid or expired state. Please try connecting again from Claude.</h1>', status_code=400)
-    resp = httpx.post(TOKEN_URL, data={
-        'grant_type': 'authorization_code',
-        'code': code,
-        'redirect_uri': REDIRECT_URI,
-        'client_id': CLIENT_ID,
-        'client_secret': CLIENT_SECRET,
-    })
+        return HTMLResponse('Invalid state', status_code=400)
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(TOKEN_URL, data={
+            'grant_type': 'authorization_code',
+            'code': code,
+            'redirect_uri': REDIRECT_URI,
+            'client_id': CLIENT_ID,
+            'client_secret': CLIENT_SECRET,
+        })
     if resp.status_code != 200:
-        return HTMLResponse(f'<h1>Token error: {resp.text}</h1>', status_code=400)
+        return HTMLResponse(f'Token exchange failed: {resp.text}', status_code=400)
     tokens = resp.json()
     token_store['access_token'] = tokens.get('access_token', '')
     token_store['refresh_token'] = tokens.get('refresh_token', '')
@@ -151,12 +147,13 @@ async def token_endpoint(request: Request):
         })
     elif grant_type == 'refresh_token':
         rt = form.get('refresh_token', '')
-        resp = httpx.post(TOKEN_URL, data={
-            'grant_type': 'refresh_token',
-            'refresh_token': rt,
-            'client_id': CLIENT_ID,
-            'client_secret': CLIENT_SECRET,
-        })
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(TOKEN_URL, data={
+                'grant_type': 'refresh_token',
+                'refresh_token': rt,
+                'client_id': CLIENT_ID,
+                'client_secret': CLIENT_SECRET,
+            })
         if resp.status_code != 200:
             return JSONResponse({'error': 'invalid_grant'}, status_code=400)
         data = resp.json()
@@ -177,7 +174,10 @@ async def handle_sse(request: Request):
 app = Starlette(
     debug=True,
     routes=[
+        Route('/', health),
         Route('/health', health),
+        Route('/.well-known/oauth-authorization-server', oauth_metadata),
+        Route('/.well-known/oauth-protected-resource', oauth_metadata),
         Route('/authorize', authorize),
         Route('/token', token_endpoint, methods=['POST']),
         Route('/callback', whoop_callback),
