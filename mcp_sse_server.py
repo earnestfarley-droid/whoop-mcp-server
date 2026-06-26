@@ -50,7 +50,7 @@ async def list_tools():
 @app_server.call_tool()
 async def call_tool(name: str, arguments: dict):
     if name == 'get_auth_status':
-        return [TextContent(type='text', text=f'Authenticated: {bool(token_store.get("access_token"))}}')]
+        return [TextContent(type='text', text=f'Authenticated: {bool(token_store.get("access_token"))}')]
     try:
         headers = get_headers()
     except ValueError as e:
